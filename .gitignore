@@ -1,3 +1,6 @@
+# Claude Code (local only — not project config)
+.claude/
+
 # Build output
 bin/
 obj/

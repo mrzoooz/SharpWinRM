@@ -9,9 +9,23 @@
     <ImplicitUsings>disable</ImplicitUsings>
   </PropertyGroup>
 
+  <!-- Resolve System.Management.Automation from whichever location exists.
+       Traditional path (PowerShell 5.1): System32\WindowsPowerShell\v1.0\
+       Fallback: GAC (present when PS installed differently or WinSxS only). -->
+  <PropertyGroup>
+    <_SmaPs51>$(SystemRoot)\System32\WindowsPowerShell\v1.0\System.Management.Automation.dll</_SmaPs51>
+    <_SmaGac>$(SystemRoot)\Microsoft.NET\assembly\GAC_MSIL\System.Management.Automation\v4.0_3.0.0.0__31bf3856ad364e35\System.Management.Automation.dll</_SmaGac>
+    <SmaHintPath Condition="Exists('$(_SmaPs51)')">$(_SmaPs51)</SmaHintPath>
+    <SmaHintPath Condition="'$(SmaHintPath)' == '' And Exists('$(_SmaGac)')">$(_SmaGac)</SmaHintPath>
+  </PropertyGroup>
+
   <ItemGroup>
     <Reference Include="Microsoft.CSharp" />
     <Reference Include="System.Net.Http" />
+    <Reference Include="System.Management.Automation">
+      <HintPath>$(SmaHintPath)</HintPath>
+      <Private>false</Private>
+    </Reference>
   </ItemGroup>
 
 </Project>

@@ -1,16 +1,14 @@
 using System;
-using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Security.Principal;
-using System.Text;
 using System.Xml;
 
 namespace SharpWinRM
 {
     /// <summary>
-    /// COM-based WinRM client via WSMan.Automation (wsmauto.dll).
-    /// Used for /password: and /kerberos: — Windows handles auth.
-    /// For /rc4: (pass-the-hash), WinRmHttpClient is used instead.
+    /// COM-based WS-Man client via WSMan.Automation (wsmauto.dll).
+    /// All remote operations use WMI method invocation over WS-Man.
+    /// Remote process tree: svchost (WinMgmt) → wmiprvse.exe (→ child only for CreateProcess).
     /// </summary>
     internal class WsManClient : IDisposable
     {
@@ -19,12 +17,10 @@ namespace SharpWinRM
         private readonly WindowsImpersonationContext _impCtx;
         private readonly IntPtr _token;
 
-        private const string ShellUri   = "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/cmd";
-        private const string ShellNs    = "http://schemas.microsoft.com/wbem/wsman/1/windows/shell";
-        private const string ActionCmd  = "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Command";
-        private const string ActionRecv = "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Receive";
-        private const string ActionSig  = "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Signal";
-        private const string ActionSend = "http://schemas.microsoft.com/wbem/wsman/1/windows/shell/Send";
+        // WMI class base URI — all WMI method calls use this prefix.
+        private const string WmiBase = "http://schemas.microsoft.com/wbem/wsman/1/wmi/root/cimv2/";
+        // HKEY_LOCAL_MACHINE = 0x80000002 expressed as uint32 for StdRegProv
+        private const string Hklm = "2147483650";
 
         internal static WsManClient Create(WinRmContext ctx)
         {
@@ -43,26 +39,22 @@ namespace SharpWinRM
                 else
                     impCtx = new WindowsIdentity(token).Impersonate();
             }
-            // Kerberos: no impersonation — use current token as-is
 
             Type wsmanType = Type.GetTypeFromProgID("WSMan.Automation", true);
             dynamic wsman  = Activator.CreateInstance(wsmanType);
 
-            // WSMan session flags (from Windows SDK wsmanautomation.h)
-            const int WSManFlagUTF8                 = 0x00000001;
-            const int WSManFlagCredUserNamePassword  = 0x00001000;
-            const int WSManFlagSkipCACheck           = 0x00002000;
-            const int WSManFlagSkipCNCheck           = 0x00004000;
-            const int WSManFlagUseNegotiate          = 0x00020000;
-            const int WSManFlagUseKerberos           = 0x00080000;
+            const int WSManFlagUTF8                = 0x00000001;
+            const int WSManFlagCredUserNamePassword = 0x00001000;
+            const int WSManFlagSkipCACheck          = 0x00002000;
+            const int WSManFlagSkipCNCheck          = 0x00004000;
+            const int WSManFlagUseNegotiate         = 0x00020000;
+            const int WSManFlagUseKerberos          = 0x00080000;
 
             int flags;
             dynamic opts = null;
 
             if (ctx.Auth == AuthMode.Ptt || ctx.Auth == AuthMode.Ticket)
             {
-                // Kerberos provides GSSAPI message-level encryption over HTTP —
-                // no NoEncryption/UseSsl flag needed; AllowUnencrypted doesn't apply.
                 flags = WSManFlagUseKerberos
                       | WSManFlagUTF8
                       | WSManFlagSkipCACheck
@@ -93,242 +85,131 @@ namespace SharpWinRM
             _wsman = wsman; _session = session; _impCtx = impCtx; _token = token;
         }
 
-        internal string RunCommand(string command)
+        // ── WMI Win32_Process ──────────────────────────────────────────────────────
+
+        // Invokes Win32_Process.Create. Returns the PID of the spawned process.
+        // Remote process tree: svchost (WinMgmt) → wmiprvse.exe → <process>
+        internal int WmiCreateProcess(string commandLine)
         {
-            string createBody =
-                "<rsp:Shell xmlns:rsp=\"" + ShellNs + "\">" +
-                "<rsp:InputStreams>stdin</rsp:InputStreams>" +
-                "<rsp:OutputStreams>stdout stderr</rsp:OutputStreams>" +
-                "</rsp:Shell>";
+            string classUri  = WmiBase + "Win32_Process";
+            string actionUri = classUri + "/Create";
+            string body =
+                "<p:Create_INPUT xmlns:p=\"" + classUri + "\">" +
+                "<p:CommandLine>" + XmlEscape(commandLine) + "</p:CommandLine>" +
+                "</p:Create_INPUT>";
 
-            string shellResp = (string)_session.Create(ShellUri, createBody, 0);
-            string shellId   = ParseShellId(shellResp);
-            if (string.IsNullOrEmpty(shellId))
-                throw new Exception("Could not parse ShellId.");
+            string resp = (string)_session.Invoke(actionUri, classUri, body, 0);
+            var doc = new XmlDocument(); doc.LoadXml(resp);
 
-            string shellWithId = ShellUri + "?ShellId=" + shellId;
+            string retVal = SelectLocalName(doc, "ReturnValue") ?? "-1";
+            if (retVal != "0")
+                throw new Exception("Win32_Process.Create failed (ReturnValue=" + retVal + ")");
+
+            return int.Parse(SelectLocalName(doc, "ProcessId") ?? "0");
+        }
+
+        // Returns true if a process with the given PID still exists on the remote.
+        // Uses WS-Man Get with the Win32_Process Handle key — throws a SOAP fault if gone.
+        internal bool WmiProcessExists(int pid)
+        {
             try
             {
-                string cmdBody =
-                    "<rsp:CommandLine xmlns:rsp=\"" + ShellNs + "\">" +
-                    "<rsp:Command>cmd.exe</rsp:Command>" +
-                    "<rsp:Arguments>/c " + XmlEscape(command) + "</rsp:Arguments>" +
-                    "</rsp:CommandLine>";
-
-                string cmdResp   = (string)_session.Invoke(ActionCmd, shellWithId, cmdBody, 0);
-                string commandId = ParseCommandId(cmdResp);
-                if (string.IsNullOrEmpty(commandId))
-                    throw new Exception("Could not parse CommandId.");
-
-                var output = new StringBuilder();
-                bool done  = false;
-                while (!done)
-                {
-                    string recvBody =
-                        "<rsp:Receive xmlns:rsp=\"" + ShellNs + "\">" +
-                        "<rsp:DesiredStream CommandId=\"" + commandId +
-                        "\">stdout stderr</rsp:DesiredStream>" +
-                        "</rsp:Receive>";
-
-                    string recvResp = (string)_session.Invoke(ActionRecv, shellWithId, recvBody, 0);
-                    var doc = new XmlDocument(); doc.LoadXml(recvResp);
-                    foreach (XmlNode node in doc.GetElementsByTagName("Stream", ShellNs))
-                        if (!string.IsNullOrEmpty(node.InnerText))
-                            output.Append(Encoding.UTF8.GetString(
-                                Convert.FromBase64String(node.InnerText)));
-                    var states = doc.GetElementsByTagName("CommandState", ShellNs);
-                    if (states.Count > 0 &&
-                        ((XmlElement)states[0]).GetAttribute("State").EndsWith("Done"))
-                        done = true;
-                }
-
-                try
-                {
-                    string sigBody =
-                        "<rsp:Signal xmlns:rsp=\"" + ShellNs + "\" CommandId=\"" + commandId + "\">" +
-                        "<rsp:Code>http://schemas.microsoft.com/wbem/wsman/1/windows/shell/signal/ctrl_c</rsp:Code>" +
-                        "</rsp:Signal>";
-                    _session.Invoke(ActionSig, shellWithId, sigBody, 0);
-                }
-                catch { }
-
-                return output.ToString();
+                _session.Get(WmiBase + "Win32_Process?Handle=" + pid, 0);
+                return true;
             }
-            finally
-            {
-                try { _session.Delete(shellWithId, 0); } catch { }
-            }
+            catch { return false; }
         }
 
-        // Runs command via cmd.exe and returns raw stdout bytes.
-        // Unlike RunCommand, this separates stdout from stderr and never decodes as
-        // UTF-8 — preserving binary content byte-for-byte as it comes off the pipe.
-        internal byte[] RunCommandBytes(string command)
+        // ── WMI StdRegProv — no child process for any of these ────────────────────
+
+        // Creates a registry key under HKLM.
+        internal void WmiRegCreateKey(string subKey)
         {
-            string createBody =
-                "<rsp:Shell xmlns:rsp=\"" + ShellNs + "\">" +
-                "<rsp:InputStreams>stdin</rsp:InputStreams>" +
-                "<rsp:OutputStreams>stdout stderr</rsp:OutputStreams>" +
-                "</rsp:Shell>";
+            string classUri  = WmiBase + "StdRegProv";
+            string actionUri = classUri + "/CreateKey";
+            string body =
+                "<p:CreateKey_INPUT xmlns:p=\"" + classUri + "\">" +
+                "<p:hDefKey>" + Hklm + "</p:hDefKey>" +
+                "<p:sSubKeyName>" + XmlEscape(subKey) + "</p:sSubKeyName>" +
+                "</p:CreateKey_INPUT>";
 
-            string shellResp = (string)_session.Create(ShellUri, createBody, 0);
-            string shellId   = ParseShellId(shellResp);
-            if (string.IsNullOrEmpty(shellId))
-                throw new Exception("Could not parse ShellId.");
-
-            string shellWithId = ShellUri + "?ShellId=" + shellId;
-            try
-            {
-                string cmdBody =
-                    "<rsp:CommandLine xmlns:rsp=\"" + ShellNs + "\">" +
-                    "<rsp:Command>cmd.exe</rsp:Command>" +
-                    "<rsp:Arguments>/c " + XmlEscape(command) + "</rsp:Arguments>" +
-                    "</rsp:CommandLine>";
-
-                string cmdResp   = (string)_session.Invoke(ActionCmd, shellWithId, cmdBody, 0);
-                string commandId = ParseCommandId(cmdResp);
-                if (string.IsNullOrEmpty(commandId))
-                    throw new Exception("Could not parse CommandId.");
-
-                var  stdoutBytes = new List<byte>();
-                var  stderrText  = new StringBuilder();
-                bool done        = false;
-                while (!done)
-                {
-                    string recvBody =
-                        "<rsp:Receive xmlns:rsp=\"" + ShellNs + "\">" +
-                        "<rsp:DesiredStream CommandId=\"" + commandId +
-                        "\">stdout stderr</rsp:DesiredStream>" +
-                        "</rsp:Receive>";
-                    string recvResp = (string)_session.Invoke(ActionRecv, shellWithId, recvBody, 0);
-                    var doc = new XmlDocument(); doc.LoadXml(recvResp);
-                    foreach (XmlNode node in doc.GetElementsByTagName("Stream", ShellNs))
-                    {
-                        if (string.IsNullOrEmpty(node.InnerText)) continue;
-                        byte[] chunk = Convert.FromBase64String(node.InnerText);
-                        if (((XmlElement)node).GetAttribute("Name") == "stdout")
-                            stdoutBytes.AddRange(chunk);
-                        else
-                            stderrText.Append(Encoding.UTF8.GetString(chunk));
-                    }
-                    var states = doc.GetElementsByTagName("CommandState", ShellNs);
-                    if (states.Count > 0 &&
-                        ((XmlElement)states[0]).GetAttribute("State").EndsWith("Done"))
-                        done = true;
-                }
-
-                if (stdoutBytes.Count == 0 && stderrText.Length > 0)
-                    throw new Exception(stderrText.ToString().Trim());
-
-                return stdoutBytes.ToArray();
-            }
-            finally
-            {
-                try { _session.Delete(shellWithId, 0); } catch { }
-            }
+            _session.Invoke(actionUri, classUri, body, 0);
         }
 
-        // Starts exe directly (no cmd.exe wrapper) and pipes stdinBytes via the WinRM
-        // Send action.  File data travels through the stdin channel — never a command line.
-        internal string RunWithStdin(string exe, string exeArgs, byte[] stdinBytes)
+        // Writes a REG_SZ value to HKLM. Key must already exist.
+        internal void WmiRegSetString(string subKey, string valueName, string value)
         {
-            string createBody =
-                "<rsp:Shell xmlns:rsp=\"" + ShellNs + "\">" +
-                "<rsp:InputStreams>stdin</rsp:InputStreams>" +
-                "<rsp:OutputStreams>stdout stderr</rsp:OutputStreams>" +
-                "</rsp:Shell>";
+            string classUri  = WmiBase + "StdRegProv";
+            string actionUri = classUri + "/SetStringValue";
+            string body =
+                "<p:SetStringValue_INPUT xmlns:p=\"" + classUri + "\">" +
+                "<p:hDefKey>" + Hklm + "</p:hDefKey>" +
+                "<p:sSubKeyName>" + XmlEscape(subKey) + "</p:sSubKeyName>" +
+                "<p:sValueName>" + XmlEscape(valueName) + "</p:sValueName>" +
+                "<p:sValue>" + XmlEscape(value) + "</p:sValue>" +
+                "</p:SetStringValue_INPUT>";
 
-            string shellResp = (string)_session.Create(ShellUri, createBody, 0);
-            string shellId   = ParseShellId(shellResp);
-            if (string.IsNullOrEmpty(shellId))
-                throw new Exception("Could not parse ShellId.");
-
-            string shellWithId = ShellUri + "?ShellId=" + shellId;
-            try
-            {
-                string cmdBody =
-                    "<rsp:CommandLine xmlns:rsp=\"" + ShellNs + "\">" +
-                    "<rsp:Command>" + XmlEscape(exe) + "</rsp:Command>" +
-                    "<rsp:Arguments>" + XmlEscape(exeArgs) + "</rsp:Arguments>" +
-                    "</rsp:CommandLine>";
-
-                string cmdResp   = (string)_session.Invoke(ActionCmd, shellWithId, cmdBody, 0);
-                string commandId = ParseCommandId(cmdResp);
-                if (string.IsNullOrEmpty(commandId))
-                    throw new Exception("Could not parse CommandId.");
-
-                // Push stdin in 64 KB chunks — each chunk is one WinRM Send message.
-                const int chunkSize = 65536;
-                for (int offset = 0; offset < stdinBytes.Length; offset += chunkSize)
-                {
-                    int    len   = Math.Min(chunkSize, stdinBytes.Length - offset);
-                    byte[] chunk = new byte[len];
-                    Array.Copy(stdinBytes, offset, chunk, 0, len);
-                    string sendBody =
-                        "<rsp:Send xmlns:rsp=\"" + ShellNs + "\">" +
-                        "<rsp:Stream Name=\"stdin\" CommandId=\"" + commandId + "\">" +
-                        Convert.ToBase64String(chunk) + "</rsp:Stream></rsp:Send>";
-                    _session.Invoke(ActionSend, shellWithId, sendBody, 0);
-                }
-
-                // Close stdin (EOF) so the process knows input is done.
-                string eofBody =
-                    "<rsp:Send xmlns:rsp=\"" + ShellNs + "\">" +
-                    "<rsp:Stream Name=\"stdin\" CommandId=\"" + commandId + "\" End=\"TRUE\"></rsp:Stream>" +
-                    "</rsp:Send>";
-                _session.Invoke(ActionSend, shellWithId, eofBody, 0);
-
-                // Collect stdout/stderr until the process exits.
-                var  output = new StringBuilder();
-                bool done   = false;
-                while (!done)
-                {
-                    string recvBody =
-                        "<rsp:Receive xmlns:rsp=\"" + ShellNs + "\">" +
-                        "<rsp:DesiredStream CommandId=\"" + commandId +
-                        "\">stdout stderr</rsp:DesiredStream>" +
-                        "</rsp:Receive>";
-                    string recvResp = (string)_session.Invoke(ActionRecv, shellWithId, recvBody, 0);
-                    var doc = new XmlDocument(); doc.LoadXml(recvResp);
-                    foreach (XmlNode node in doc.GetElementsByTagName("Stream", ShellNs))
-                        if (!string.IsNullOrEmpty(node.InnerText))
-                            output.Append(Encoding.UTF8.GetString(
-                                Convert.FromBase64String(node.InnerText)));
-                    var states = doc.GetElementsByTagName("CommandState", ShellNs);
-                    if (states.Count > 0 &&
-                        ((XmlElement)states[0]).GetAttribute("State").EndsWith("Done"))
-                        done = true;
-                }
-                return output.ToString();
-            }
-            finally
-            {
-                try { _session.Delete(shellWithId, 0); } catch { }
-            }
+            _session.Invoke(actionUri, classUri, body, 0);
         }
 
-        private static string ParseShellId(string xml)
+        // Reads a REG_SZ value from HKLM. Returns null if the value does not exist.
+        internal string WmiRegGetString(string subKey, string valueName)
         {
-            var doc = new XmlDocument(); doc.LoadXml(xml);
-            var ns  = new XmlNamespaceManager(doc.NameTable);
-            ns.AddNamespace("rsp", ShellNs);
-            ns.AddNamespace("w", "http://schemas.dmtf.org/wbem/wsman/1/wsman.xsd");
-            return doc.SelectSingleNode("//w:Selector[@Name='ShellId']", ns)?.InnerText
-                ?? doc.SelectSingleNode("//rsp:Shell/rsp:ShellId", ns)?.InnerText
-                ?? doc.DocumentElement?.InnerText?.Trim();
+            string classUri  = WmiBase + "StdRegProv";
+            string actionUri = classUri + "/GetStringValue";
+            string body =
+                "<p:GetStringValue_INPUT xmlns:p=\"" + classUri + "\">" +
+                "<p:hDefKey>" + Hklm + "</p:hDefKey>" +
+                "<p:sSubKeyName>" + XmlEscape(subKey) + "</p:sSubKeyName>" +
+                "<p:sValueName>" + XmlEscape(valueName) + "</p:sValueName>" +
+                "</p:GetStringValue_INPUT>";
+
+            string resp = (string)_session.Invoke(actionUri, classUri, body, 0);
+            var doc = new XmlDocument(); doc.LoadXml(resp);
+
+            if ((SelectLocalName(doc, "ReturnValue") ?? "-1") != "0") return null;
+            return SelectLocalName(doc, "sValue");
         }
 
-        private static string ParseCommandId(string xml)
+        // Deletes a single registry value from HKLM.
+        internal void WmiRegDeleteValue(string subKey, string valueName)
         {
-            var doc = new XmlDocument(); doc.LoadXml(xml);
-            var ns  = new XmlNamespaceManager(doc.NameTable);
-            ns.AddNamespace("rsp", ShellNs);
-            return doc.SelectSingleNode("//rsp:CommandId", ns)?.InnerText;
+            string classUri  = WmiBase + "StdRegProv";
+            string actionUri = classUri + "/DeleteValue";
+            string body =
+                "<p:DeleteValue_INPUT xmlns:p=\"" + classUri + "\">" +
+                "<p:hDefKey>" + Hklm + "</p:hDefKey>" +
+                "<p:sSubKeyName>" + XmlEscape(subKey) + "</p:sSubKeyName>" +
+                "<p:sValueName>" + XmlEscape(valueName) + "</p:sValueName>" +
+                "</p:DeleteValue_INPUT>";
+
+            _session.Invoke(actionUri, classUri, body, 0);
         }
+
+        // Deletes an entire registry key (and all its values) from HKLM.
+        internal void WmiRegDeleteKey(string subKey)
+        {
+            string classUri  = WmiBase + "StdRegProv";
+            string actionUri = classUri + "/DeleteKey";
+            string body =
+                "<p:DeleteKey_INPUT xmlns:p=\"" + classUri + "\">" +
+                "<p:hDefKey>" + Hklm + "</p:hDefKey>" +
+                "<p:sSubKeyName>" + XmlEscape(subKey) + "</p:sSubKeyName>" +
+                "</p:DeleteKey_INPUT>";
+
+            _session.Invoke(actionUri, classUri, body, 0);
+        }
+
+        // ── Helpers ────────────────────────────────────────────────────────────────
+
+        // Matches XML elements by local-name, ignoring namespace prefixes.
+        // WMI responses vary by Windows version; this handles all of them.
+        private static string SelectLocalName(XmlDocument doc, string localName) =>
+            doc.SelectSingleNode("//*[local-name()='" + localName + "']")?.InnerText;
 
         private static string XmlEscape(string s) =>
-            s.Replace("&","&amp;").Replace("<","&lt;").Replace(">","&gt;")
-             .Replace("\"","&quot;").Replace("'","&apos;");
+            s.Replace("&", "&amp;").Replace("<", "&lt;").Replace(">", "&gt;")
+             .Replace("\"", "&quot;").Replace("'", "&apos;");
 
         [DllImport("advapi32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
         private static extern bool LogonUser(string user, string domain, string password,
