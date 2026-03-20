@@ -95,7 +95,7 @@ namespace SharpWinRM.Commands
 
                 // Step 2: Poll for staged data (no child process — pure wmiprvse.exe)
                 string b64 = null;
-                for (int i = 0; i < 30; i++)
+                for (int i = 0; i < 60; i++)
                 {
                     System.Threading.Thread.Sleep(1000);
                     b64 = client.WmiRegGetString(stagingKey, stagingValue);
@@ -106,7 +106,7 @@ namespace SharpWinRM.Commands
                 try { client.WmiRegDeleteValue(stagingKey, stagingValue); } catch { }
 
                 if (b64 == null)
-                    throw new Exception("Timed out (30s) waiting for staged data. Verify path and permissions.");
+                    throw new Exception("Timed out (60s) waiting for staged data. Verify path and permissions.");
 
                 byte[] data = Convert.FromBase64String(b64.Trim());
 

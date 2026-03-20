@@ -56,8 +56,8 @@ namespace SharpWinRM.Commands
             // ── How this works ────────────────────────────────────────────────────
             //
             // Step 1 — StdRegProv.CreateKey + SetStringValue (loop):
-            //   Stages base64-encoded file chunks into HKLM under a random key.
-            //   No process spawned — handled entirely inside wmiprvse.exe.
+            //   Stages base64-encoded file chunks into a randomly named HKLM subkey.
+            //   No child process — handled entirely inside wmiprvse.exe.
             //
             // Step 2 — Win32_Process.Create:
             //   Spawns a brief powershell.exe (parent: wmiprvse.exe) with a
@@ -65,10 +65,13 @@ namespace SharpWinRM.Commands
             //   file to disk, then sets a "done" sentinel value.
             //   File data and path are NOT in plain-text process args.
             //
-            // Step 3 — StdRegProv.GetStringValue (poll):
-            //   Waits for "done" flag. No child process — pure wmiprvse.exe.
+            // Step 3 — Win32_Process?Handle=<pid> (poll):
+            //   Waits for the PS process to exit via WS-Man Get. No child process.
             //
-            // Step 4 — StdRegProv.DeleteKey:
+            // Step 4 — StdRegProv.GetStringValue:
+            //   Reads the "done" sentinel once after process exit to detect errors.
+            //
+            // Step 5 — StdRegProv.DeleteKey:
             //   Removes the staging key. No child process.
             //
             // Remote process tree:
@@ -111,27 +114,25 @@ namespace SharpWinRM.Commands
                     "[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('" + stagingKey + "',1).SetValue('done',\"ERR:$($_.Exception.Message)\")" +
                     "}";
 
-                string encodedCmd  = Convert.ToBase64String(Encoding.Unicode.GetBytes(psScript));
+                string encodedCmd = Convert.ToBase64String(Encoding.Unicode.GetBytes(psScript));
                 Helpers.PrintInfo("Invoking Win32_Process.Create via WMI...");
                 int pid = client.WmiCreateProcess(
                     "powershell.exe -NoProfile -NonInteractive -EncodedCommand " + encodedCmd);
-                Helpers.PrintInfo("Process spawned (PID " + pid + ") — polling for completion...");
+                Helpers.PrintInfo("Process spawned (PID " + pid + ") — waiting for exit...");
 
-                // Step 3: Wait for PS process to exit (poll PID via WS-Man Get).
-                // Then read "done" once — no race condition, no arbitrary registry poll loop.
-                Helpers.PrintInfo("Waiting for process to exit...");
-                int maxWait = 300; // 5 minutes hard cap
+                // Step 3: Poll for process exit via WS-Man Get (no child process)
+                int maxWait = 300;
                 for (int i = 0; i < maxWait; i++)
                 {
                     System.Threading.Thread.Sleep(1000);
                     if (!client.WmiProcessExists(pid)) break;
                 }
 
-                // Give the registry write a moment to flush, then read done once.
+                // Step 4: Read done sentinel once after process exits
                 System.Threading.Thread.Sleep(500);
                 string done = client.WmiRegGetString(stagingKey, "done");
 
-                // Step 4: Clean up staging key regardless of outcome
+                // Step 5: Clean up staging key regardless of outcome
                 try { client.WmiRegDeleteKey(stagingKey); } catch { }
 
                 if (done != null && done.StartsWith("ERR:"))

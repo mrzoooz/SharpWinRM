@@ -1,7 +1,4 @@
 using System;
-using System.Management.Automation;
-using System.Management.Automation.Runspaces;
-using System.Security;
 
 namespace SharpWinRM.Commands
 {
@@ -47,72 +44,29 @@ namespace SharpWinRM.Commands
 
         private static void DoPsrp(WinRmContext ctx, string command)
         {
-            // Executes via the PowerShell Remoting Protocol (PSRP) endpoint rather than
-            // the WinRM cmd shell.  Remote process tree:
-            //
-            //   svchost.exe (WsmSvc) → wsmprovhost.exe
-            //
-            // No cmd.exe, no powershell.exe child — the PS engine runs in-process inside
-            // wsmprovhost.exe, identical to legitimate Invoke-Command / Enter-PSSession.
-            // The command never appears in any process command line or Sysmon Event ID 1.
-            PSCredential credential = null;
-            if (ctx.Auth == AuthMode.Password)
+            // Executes via the PowerShell Remoting Protocol (PSRP).
+            // PS engine runs in-process inside wsmprovhost.exe — no child process.
+            // Remote process tree: svchost (WsmSvc) → wsmprovhost.exe (no children)
+            using (var psrp = PsrpClient.Connect(ctx))
             {
-                var secure = new SecureString();
-                foreach (char c in ctx.Password) secure.AppendChar(c);
-                credential = new PSCredential(ctx.DisplayUser, secure);
-            }
+                var results = psrp.RunFormatted(command);
 
-            var connInfo = new WSManConnectionInfo(
-                new Uri(ctx.Url),
-                "http://schemas.microsoft.com/powershell/Microsoft.PowerShell",
-                credential);
-
-            connInfo.AuthenticationMechanism = (ctx.Auth == AuthMode.Ptt || ctx.Auth == AuthMode.Ticket)
-                ? AuthenticationMechanism.Kerberos
-                : AuthenticationMechanism.Negotiate;
-
-            if (ctx.Ssl)
-            {
-                connInfo.SkipCACheck         = true;
-                connInfo.SkipCNCheck         = true;
-                connInfo.SkipRevocationCheck = true;
-            }
-
-            connInfo.OpenTimeout      = ctx.TimeoutMs;
-            connInfo.OperationTimeout = ctx.TimeoutMs;
-
-            using (var runspace = RunspaceFactory.CreateRunspace(connInfo))
-            {
-                runspace.Open();
-
-                using (var ps = PowerShell.Create())
+                bool hasOutput = false;
+                foreach (string s in results)
                 {
-                    ps.Runspace = runspace;
-                    ps.AddScript(command).AddCommand("Out-String").AddParameter("Width", 4096);
-
-                    var results = ps.Invoke<string>();
-
-                    foreach (var e in ps.Streams.Error)
-                        Helpers.PrintWarn("[error] " + e);
-
-                    bool hasOutput = false;
-                    foreach (string s in results)
+                    if (string.IsNullOrWhiteSpace(s)) continue;
+                    string[] lines = s.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
+                    foreach (string line in lines)
                     {
-                        if (string.IsNullOrWhiteSpace(s)) continue;
-                        string[] lines = s.Replace("\r\n", "\n").Replace('\r', '\n').Split('\n');
-                        foreach (string line in lines)
-                        {
-                            string trimmed = line.TrimEnd();
-                            if (string.IsNullOrEmpty(trimmed)) continue;
-                            Console.WriteLine(trimmed);
-                            hasOutput = true;
-                        }
+                        string trimmed = line.TrimEnd();
+                        if (string.IsNullOrEmpty(trimmed)) continue;
+                        Console.WriteLine(trimmed);
+                        hasOutput = true;
                     }
-
-                    if (!hasOutput && ps.Streams.Error.Count == 0)
-                        Helpers.PrintWarn("(no output)");
                 }
+
+                if (!hasOutput)
+                    Helpers.PrintWarn("(no output)");
             }
         }
     }

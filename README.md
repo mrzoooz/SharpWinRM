@@ -69,15 +69,19 @@ All communication is SOAP XML over HTTP(S). SharpWinRM uses the **WSMan.Automati
 
 ### Execution Model
 
-SharpWinRM uses two distinct remote execution mechanisms depending on the operation:
+SharpWinRM deliberately uses two different remote execution mechanisms, chosen independently for opsec:
 
 **`exec` — PowerShell Remoting Protocol (PSRP)**
 
-Opens a PSRP runspace via `WSManConnectionInfo` targeting the `Microsoft.PowerShell` endpoint. The PowerShell engine runs in-process inside `wsmprovhost.exe` — no child process is spawned, and the command never appears in any process argument list. Identical to `Invoke-Command`.
+Opens a PSRP runspace via `WSManConnectionInfo` targeting the `Microsoft.PowerShell` endpoint. The PowerShell engine runs in-process inside `wsmprovhost.exe` — **no child process is spawned at any point**, and the command never appears in any process argument list. Identical to `Invoke-Command`.
+
+`wsmprovhost.exe` with no children is exactly what legitimate admin tooling produces. Although `wmiprvse.exe` is noisier background traffic, using WMI for exec would require `Win32_Process.Create` to spawn a child process to run the command and then stage output back through registry — producing a `wmiprvse.exe → powershell.exe` parent-child relationship that is one of the most heavily signatured lateral movement patterns across CrowdStrike, Defender, and SentinelOne. A child process under any parent is worse than no child process at all.
 
 **`upload` / `download` — WMI Method Invocation over WS-Man**
 
-Uses `StdRegProv` and `Win32_Process` WMI methods delivered as WS-Man SOAP actions — not the WinRM shell API. The remote process tree shows `wmiprvse.exe` (WMI host), not `wsmprovhost.exe` (WinRM host), making it appear as WMI activity rather than WinRM activity. File data and paths travel as base64-encoded registry values, never as plain-text process arguments.
+Uses `StdRegProv` and `Win32_Process` WMI methods delivered as WS-Man SOAP actions — not the WinRM shell API. The remote process tree shows `wmiprvse.exe` (WMI host) rather than `wsmprovhost.exe` (WinRM host).
+
+For file operations, a brief child `powershell.exe` under `wmiprvse.exe` is unavoidable — no standard WMI provider can read or write arbitrary file content natively. The tradeoff is acceptable: `wmiprvse.exe` doing registry staging (StdRegProv) generates no child process at all, and the single brief child for the file I/O step has `wmiprvse.exe` as its parent rather than a WinRM process. File data and paths travel as base64-encoded registry values, never as plain-text process arguments.
 
 ### HTTP vs HTTPS
 
@@ -331,11 +335,15 @@ svchost.exe (WinMgmt)
 
 ### Remote machine (target)
 
-| Operation | Remote process tree | Data in command line |
-|---|---|---|
-| `exec` | `svchost (WsmSvc) → wsmprovhost.exe` (no children) | No process spawned |
-| `upload` | `svchost (WinMgmt) → wmiprvse.exe → powershell.exe` (brief) | No — path/data in encoded command |
-| `download` | `svchost (WinMgmt) → wmiprvse.exe → powershell.exe` (brief) | No — path in encoded command |
+| Operation | Remote process tree | Child process | Data in args |
+|---|---|---|---|
+| `exec` | `svchost (WsmSvc) → wsmprovhost.exe` | None | N/A — no process |
+| `upload` | `svchost (WinMgmt) → wmiprvse.exe → powershell.exe` | Brief — file write only | No — `-EncodedCommand` |
+| `download` | `svchost (WinMgmt) → wmiprvse.exe → powershell.exe` | Brief — file encode only | No — `-EncodedCommand` |
+
+**Why not WMI for exec?** Using `Win32_Process.Create` for command execution requires a child process to run the command and stage output back through registry — `wmiprvse.exe → powershell.exe` is one of the most heavily signatured lateral movement patterns in EDR products. No child process (PSRP) beats a noisy parent (`wmiprvse.exe`) every time.
+
+**Why not PSRP for upload/download?** A brief `powershell.exe` child of `wmiprvse.exe` is unavoidable for file I/O since no WMI provider reads or writes arbitrary file content natively. Given that a child process is required either way, `wmiprvse.exe` as the parent is better cover than `wsmprovhost.exe`, which signals active WinRM remoting. The majority of the operation (registry staging via StdRegProv) produces zero child processes regardless.
 
 ### Authentication opsec ranking
 
@@ -371,14 +379,14 @@ SharpWinRM.exe exec /target:srv01 /user:CORP\jdoe /ticket:doIFuj... /command:who
 Rubeus.exe asktgt /user:jdoe /rc4:A87F3A337D73085C45F9416BE5787D86 /domain:CORP /outfile:jdoe.kirbi
 SharpWinRM.exe exec /target:srv01 /user:CORP\jdoe /ticket:jdoe.kirbi /command:whoami /ssl
 
-# Upload payload (PowerShell via stdin — no data in command line)
+# Upload via WMI registry staging (wmiprvse.exe parent — data not in process args)
 SharpWinRM.exe upload /target:srv01 /user:CORP\jdoe /ptt /local:beacon.exe /remote:C:\Windows\Temp
 
-# Execute command via PSRP (wsmprovhost.exe only — no child process, blends with admin traffic)
+# Execute via PSRP (wsmprovhost.exe, no child process — identical to Invoke-Command)
 SharpWinRM.exe exec /target:srv01 /user:CORP\jdoe /ptt /command:whoami
 SharpWinRM.exe exec /target:srv01 /user:CORP\jdoe /ptt /command:Get-LocalUser
 
-# Download output file via WMI (wmiprvse.exe — path not in process args)
+# Download via WMI registry staging (wmiprvse.exe parent — path not in process args)
 SharpWinRM.exe download /target:srv01 /user:CORP\jdoe /ptt /remote:C:\Windows\Temp\output.txt /local:output.txt
 
 # Full PTH chain over HTTPS
