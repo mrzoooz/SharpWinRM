@@ -1,0 +1,10 @@
+C:\Pentest Folder\DOT NET\SharpWinRM\SharpWinRM\bin\Release\net48\SharpWinRM.exe.config
+C:\Pentest Folder\DOT NET\SharpWinRM\SharpWinRM\bin\Release\net48\SharpWinRM.exe
+C:\Pentest Folder\DOT NET\SharpWinRM\SharpWinRM\bin\Release\net48\SharpWinRM.pdb
+C:\Pentest Folder\DOT NET\SharpWinRM\SharpWinRM\obj\Release\net48\SharpWinRM.csproj.AssemblyReference.cache
+C:\Pentest Folder\DOT NET\SharpWinRM\SharpWinRM\obj\Release\net48\SharpWinRM.GeneratedMSBuildEditorConfig.editorconfig
+C:\Pentest Folder\DOT NET\SharpWinRM\SharpWinRM\obj\Release\net48\SharpWinRM.AssemblyInfoInputs.cache
+C:\Pentest Folder\DOT NET\SharpWinRM\SharpWinRM\obj\Release\net48\SharpWinRM.AssemblyInfo.cs
+C:\Pentest Folder\DOT NET\SharpWinRM\SharpWinRM\obj\Release\net48\SharpWinRM.csproj.CoreCompileInputs.cache
+C:\Pentest Folder\DOT NET\SharpWinRM\SharpWinRM\obj\Release\net48\SharpWinRM.exe
+C:\Pentest Folder\DOT NET\SharpWinRM\SharpWinRM\obj\Release\net48\SharpWinRM.pdb
